@@ -2,7 +2,7 @@
 Enhanced Stock Analysis Tool for Long-Term Investors
 ===================================================
 Comprehensive technical analysis tool optimized for long-term investment decisions.
-Supports batch analysis of multiple stocks.
+Supports batch analysis of multiple stocks with sentiment analysis and ownership-based advice.
 """
 
 import yfinance as yf
@@ -12,21 +12,48 @@ import matplotlib.pyplot as plt
 import warnings
 from datetime import datetime, timedelta
 import os
+import requests
+from textblob import TextBlob
 from typing import Dict, List, Tuple, Optional, Any
+import matplotlib.dates as mdates
+import seaborn as sns
+from dotenv import load_dotenv
 
 warnings.filterwarnings("ignore")
+load_dotenv()
+
+api_key = os.getenv("API_KEY")
 
 class StockAnalyzer:
-    def __init__(self, ticker: str, period: str = "1y", investment_horizon: str = "long-term"):
+    def __init__(self, ticker: str, period: str = "1y", investment_horizon: str = "long-term", owns_stock: bool = False):
         self.ticker = ticker.upper()
         self.period = period
         self.investment_horizon = investment_horizon
+        self.owns_stock = owns_stock
         self.data = None
         self.latest = None
         self.score = 0
         self.signals = []
         self.confidence_level = "Low"
         self.price_targets = {"entry": [], "exit": []}
+        self.sentiment_score = 0
+        self.news_headlines = []
+        self.metric_info = {
+            "RSI": ("Measures momentum and overbought/oversold conditions (30-70 range).",
+                    ">70: Overbought (Bearish)\n<30: Oversold (Bullish)"),
+            "MACD": ("Measures trend direction and momentum through moving average convergence.",
+                     "Positive: Bullish trend\nNegative: Bearish trend"),
+            "ADX": ("Measures trend strength regardless of direction (>25 = strong trend).",
+                    ">25: Strong trend\n<20: Weak trend/Consolidation"),
+            "SMA200": ("200-day Simple Moving Average - key long-term trend indicator.",
+                       "Price > SMA200: Bullish\nPrice < SMA200: Bearish"),
+            "Volume Ratio": ("Compares current volume to 20-day average.",
+                             ">1.5: Strong conviction\n<0.5: Weak conviction"),
+            "ATR": ("Measures volatility through average true range.",
+                    "High: Increased risk/opportunity\nLow: Stability but limited moves"),
+            "Momentum_200": ("200-day price change percentage.",
+                             "Positive: Bullish momentum\nNegative: Bearish momentum")
+        }
     
     def fetch_data(self) -> bool:
         try:
@@ -53,6 +80,34 @@ class StockAnalyzer:
         except Exception as e:
             print(f"❌ Error fetching data: {str(e)}")
             return False
+    
+    def get_news_sentiment(self):
+        """Fetch news headlines and calculate sentiment score"""
+        if not api_key or api_key == "YOUR_NEWS_API_KEY":
+            print("ℹ️ News API not configured. Skipping sentiment analysis.")
+            return
+            
+        try:
+            # Fetch news using NewsAPI
+            url = f"https://newsapi.org/v2/everything?q={self.ticker}&apiKey={api_key}&pageSize=10"
+            response = requests.get(url)
+            articles = response.json().get('articles', [])
+            
+            sentiment_scores = []
+            self.news_headlines = []
+            
+            for article in articles[:5]:  # Analyze top 5 articles
+                title = article.get('title', '')
+                content = article.get('description', '') or article.get('content', '')
+                if title:
+                    self.news_headlines.append(title)
+                    analysis = TextBlob(title + " " + content)
+                    sentiment_scores.append(analysis.sentiment.polarity)
+            
+            if sentiment_scores:
+                self.sentiment_score = sum(sentiment_scores) / len(sentiment_scores)
+        except Exception as e:
+            print(f"⚠️ Error fetching news: {str(e)}")
     
     def calculate_indicators(self):
         close = self.data['Close']
@@ -119,11 +174,11 @@ class StockAnalyzer:
         self.data['Volume_Ratio'] = volume / self.data['Volume_SMA20']
         
         # 10. Price momentum
-        self.data['Momentum_50'] = close / close.shift(50) - 1  # Long-term momentum
+        self.data['Momentum_50'] = close / close.shift(50) - 1
         self.data['Momentum_200'] = close / close.shift(200) - 1
         
         # 11. Support/Resistance levels
-        self.data['Resistance'] = high.rolling(window=50).max()  # Longer window for LT
+        self.data['Resistance'] = high.rolling(window=50).max()
         self.data['Support'] = low.rolling(window=50).min()
 
     def _calculate_adx(self, period: int = 14) -> pd.Series:
@@ -162,6 +217,7 @@ class StockAnalyzer:
         self.score = 0
         self.signals = []
         self.price_targets = {"entry": [], "exit": []}
+        self.sentiment_score = 0  # Reset sentiment score
 
         trend_score = self._analyze_trend()
         self.score += trend_score
@@ -178,8 +234,15 @@ class StockAnalyzer:
         volatility_score = self._analyze_volatility()
         self.score += volatility_score
 
+        # Adjust score based on ownership
+        if self.owns_stock and self.score > 0:
+            self.score -= 1  # Be more conservative for holders
+        elif not self.owns_stock and self.score < 0:
+            self.score += 1  # Be more conservative for non-holders
+
         self._calculate_price_targets()
         self._calculate_confidence()
+        self.get_news_sentiment()
     
     def _analyze_trend(self) -> float:
         score = 0
@@ -351,18 +414,21 @@ class StockAnalyzer:
         close = self.latest['Close']
         
         # Entry targets
-        self.price_targets['entry'].append(self.latest['BB_Lower'] * 0.98)  # Below lower BB
-        self.price_targets['entry'].append(self.latest['Support'] * 0.99)  # Near support
-        self.price_targets['entry'].append(self.latest['SMA200'] * 0.97)  # Below 200-day SMA
+        self.price_targets['entry'].append(max(self.latest['BB_Lower'], self.latest['Support']) * 0.98)
+        self.price_targets['entry'].append(self.latest['SMA200'] * 0.98)
         
         # Exit targets
-        self.price_targets['exit'].append(self.latest['BB_Upper'] * 1.02)  # Above upper BB
-        self.price_targets['exit'].append(self.latest['Resistance'] * 1.01)  # Near resistance
-        self.price_targets['exit'].append(self.latest['SMA200'] * 1.25)  # Ambitious target
+        self.price_targets['exit'].append(min(self.latest['BB_Upper'], self.latest['Resistance']) * 1.02)
+        self.price_targets['exit'].append(self.latest['SMA200'] * 1.20)
         
         # Remove duplicates and sort
         self.price_targets['entry'] = sorted(set(self.price_targets['entry']))
         self.price_targets['exit'] = sorted(set(self.price_targets['exit']))
+        
+        # Narrow ranges for HOLD recommendations
+        if self.get_recommendation().startswith("HOLD"):
+            self.price_targets['entry'] = [min(self.price_targets['entry']), max(self.price_targets['entry'])]
+            self.price_targets['exit'] = [min(self.price_targets['exit']), max(self.price_targets['exit'])]
 
     def _calculate_confidence(self):
         """Calculate confidence level based on signal strength"""
@@ -376,26 +442,46 @@ class StockAnalyzer:
             self.confidence_level = "Low"
     
     def get_recommendation(self) -> str:
-        """Generate final recommendation with trend context"""
+        """Generate final recommendation with trend context and ownership"""
+        base_rec = ""
+        context = ""
+        
         if self.score >= 8:
-            return "STRONG BUY (Early Trend)" if self.latest['ADX'] < 25 else "STRONG BUY (Trend Established)"
+            base_rec = "STRONG BUY"
+            context = "(Early Trend)" if self.latest['ADX'] < 25 else "(Trend Established)"
         elif self.score >= 5:
-            return "BUY (Accumulation)"
+            base_rec = "BUY"
+            context = "(Accumulation)"
         elif self.score <= -8:
-            return "STRONG SELL (Downtrend)"
+            base_rec = "STRONG SELL"
+            context = "(Downtrend)"
         elif self.score <= -5:
-            return "SELL (Distribution)"
+            base_rec = "SELL"
+            context = "(Distribution)"
         else:
-            return "HOLD (Neutral)"
+            base_rec = "HOLD"
+            context = "(Neutral)"
+        
+        # Adjust recommendation based on ownership
+        if self.owns_stock:
+            if "BUY" in base_rec:
+                return "HOLD" + " " + context + " - Consider adding on dips"
+            elif "SELL" in base_rec:
+                return base_rec + " " + context + " - Consider reducing position"
+        
+        return base_rec + " " + context
 
     def get_recommendation_emoji(self) -> str:
         rec = self.get_recommendation()
         emoji_map = {
+            "STRONG BUY": "🚀🌱",
             "STRONG BUY (Early Trend)": "🚀🌱",
             "STRONG BUY (Trend Established)": "🚀📈",
             "BUY (Accumulation)": "🟢📊",
             "HOLD (Neutral)": "🟡⚖️",
+            "HOLD (Neutral) - Consider adding on dips": "🟡⬆️",
             "SELL (Distribution)": "🔴📉",
+            "SELL (Distribution) - Consider reducing position": "🔴⬇️",
             "STRONG SELL (Downtrend)": "💀📉"
         }
         return emoji_map.get(rec, "🟡⚖️")
@@ -410,13 +496,15 @@ class StockAnalyzer:
         print("=" * 80)
         print(f"🏢 Company: {self.company_name}")
         print(f"📈 Ticker: {self.ticker} | Sector: {self.sector}")
+        print(f"👤 Ownership: {'Yes' if self.owns_stock else 'No'}")
         print(f"⏱️ Analysis Period: {self.period.upper()} | Horizon: {self.investment_horizon.title()}")
         print(f"💰 Current Price: ${self.latest['Close']:.2f}")
         print(f"📅 Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
         print("\n" + "🌟" * 40)
         
         print(f"🎯 RECOMMENDATION: {emoji} {rec}")
-        print(f"📊 Signal Score: {self.score:.1f}/10")
+        print(f"📊 Technical Score: {self.score:.1f}/10")
+        print(f"📰 Sentiment Score: {self.sentiment_score:.2f} (Range: -1 to 1)")
         print(f"🎯 Confidence Level: {self.confidence_level}")
         print("\n" + "-" * 80)
         
@@ -428,22 +516,54 @@ class StockAnalyzer:
         else:
             print("No strong signals detected.")
         
-        print("\n🎯 PRICE TARGETS (Technical Estimates):")
-        print("-" * 40)
-        print("⚠️ Note: Targets are estimates based on technical structure, not guarantees")
-        print(f"• Potential Entry Zones: ${min(self.price_targets['entry']):.2f} - ${max(self.price_targets['entry']):.2f}")
-        print(f"• Potential Exit Targets: ${min(self.price_targets['exit']):.2f} - ${max(self.price_targets['exit']):.2f}")
-        print(f"• Risk/Reward Ratio: 1:{((min(self.price_targets['exit']) - self.latest['Close']) / (self.latest['Close'] - min(self.price_targets['entry']))):.1f}")
+        # Highlight price targets for HOLD recommendations
+        if rec.startswith("HOLD"):
+            print("\n🎯 STRATEGIC PRICE TARGETS FOR HOLD POSITION:")
+            print("-" * 60)
+            print("💡 For current holders, consider these strategic price levels:")
+            print(f"• Ideal ADDING zone: ${min(self.price_targets['entry']):.2f} - ${max(self.price_targets['entry']):.2f}")
+            print(f"• Ideal PROFIT-TAKING zone: ${min(self.price_targets['exit']):.2f} - ${max(self.price_targets['exit']):.2f}")
+            print(f"• Risk/Reward Ratio: 1:{((min(self.price_targets['exit']) - self.latest['Close']) / (self.latest['Close'] - min(self.price_targets['entry']))):.1f}")
+        else:
+            print("\n🎯 PRICE TARGETS (Technical Estimates):")
+            print("-" * 40)
+            print(f"• Potential Entry Zones: ${min(self.price_targets['entry']):.2f} - ${max(self.price_targets['entry']):.2f}")
+            print(f"• Potential Exit Targets: ${min(self.price_targets['exit']):.2f} - ${max(self.price_targets['exit']):.2f}")
+        
+        # News and sentiment section
+        if self.news_headlines:
+            print("\n📰 LATEST NEWS & SENTIMENT:")
+            print("-" * 40)
+            print(f"Sentiment Score: {self.sentiment_score:.2f} ({self._get_sentiment_label()})")
+            print("Top Headlines:")
+            for i, headline in enumerate(self.news_headlines[:3], 1):
+                print(f"{i}. {headline}")
         
         print("\n💡 INVESTMENT GUIDANCE:")
         print("-" * 40)
         self._print_investment_guidance(rec)
         
-        print("\n📊 KEY METRICS:")
+        print("\n📊 KEY METRICS WITH EXPLANATION:")
         print("-" * 40)
         self._print_key_metrics()
         
+        print("\n💎 LONG-TERM INSIGHTS:")
+        print("-" * 40)
+        self._print_long_term_insights()
+        
         print("\n" + "=" * 80)
+    
+    def _get_sentiment_label(self):
+        """Get sentiment label based on score"""
+        if self.sentiment_score > 0.3:
+            return "Strongly Positive"
+        elif self.sentiment_score > 0.1:
+            return "Positive"
+        elif self.sentiment_score < -0.3:
+            return "Strongly Negative"
+        elif self.sentiment_score < -0.1:
+            return "Negative"
+        return "Neutral"
     
     def _print_investment_guidance(self, recommendation: str):
         guidance = {
@@ -471,11 +591,23 @@ class StockAnalyzer:
                 "Consider rebalancing at range extremes",
                 "Monitor for breakout/breakdown signals"
             ],
+            "HOLD (Neutral) - Consider adding on dips": [
+                "Technical signals mixed but long-term outlook positive",
+                "Maintain core position",
+                "Consider adding at strategic support levels",
+                "Set stop-loss below key support"
+            ],
             "SELL (Distribution)": [
                 "Technical deterioration evident",
                 "Consider reducing position size",
                 "Implement tighter stop-loss management",
                 "Rebalance into stronger opportunities"
+            ],
+            "SELL (Distribution) - Consider reducing position": [
+                "Bearish signals emerging",
+                "Reduce exposure to preserve capital",
+                "Set stop-loss above recent highs",
+                "Consider hedging strategies"
             ],
             "STRONG SELL (Downtrend)": [
                 "Strong bearish momentum confirmed",
@@ -489,82 +621,136 @@ class StockAnalyzer:
             print(f"• {point}")
         
         # Add general long-term advice
-        print("\n💎 Long-Term Advice:")
+        print("\n💎 Long-Term Strategy:")
         print("• Maintain minimum 6-12 month investment horizon")
         print("• Rebalance portfolio quarterly")
         print("• Always use position sizing appropriate to your risk tolerance")
         
     def _print_key_metrics(self):
-        print(f"📈 RSI (14): {self.latest['RSI']:.1f}")
-        print(f"📊 MACD: {self.latest['MACD']:.3f}")
-        print(f"📏 ADX (Trend Strength): {self.latest['ADX']:.1f}")
-        print(f"📉 200-day Momentum: {self.latest['Momentum_200']*100:.1f}%")
-        print(f"📈 Price/200SMA: {(self.latest['Close']/self.latest['SMA200']-1)*100:.1f}%")
-        print(f"📊 Volume Ratio: {self.latest['Volume_Ratio']:.1f}x")
-        print(f"⚡ ATR (Volatility): {self.latest['ATR']:.2f} ({self.latest['ATR']/self.latest['Close']*100:.1f}%)")
+        metrics = [
+            ("RSI (14)", f"{self.latest['RSI']:.1f}"),
+            ("MACD", f"{self.latest['MACD']:.3f}"),
+            ("ADX (Trend Strength)", f"{self.latest['ADX']:.1f}"),
+            ("200-day Momentum", f"{self.latest['Momentum_200']*100:.1f}%"),
+            ("Price/200SMA", f"{(self.latest['Close']/self.latest['SMA200']-1)*100:.1f}%"),
+            ("Volume Ratio", f"{self.latest['Volume_Ratio']:.1f}x"),
+            ("ATR (Volatility)", f"{self.latest['ATR']:.2f} ({self.latest['ATR']/self.latest['Close']*100:.1f}%)")
+        ]
+        
+        for name, value in metrics:
+            info = self.metric_info.get(name.split(' ')[0], ("", ""))
+            print(f"{name}: {value}")
+            print(f"   • What it measures: {info[0]}")
+            print(f"   • Interpretation: {info[1]}")
+            print()
+    
+    def _print_long_term_insights(self):
+        """Provide long-term insights based on analysis"""
+        insights = []
+        
+        # Trend insights
+        if self.latest['ADX'] > 25:
+            if self.latest['Close'] > self.latest['SMA200']:
+                insights.append("Strong uptrend in place - favorable for long-term positions")
+            else:
+                insights.append("Strong downtrend - consider defensive positioning")
+        else:
+            insights.append("Market in consolidation phase - accumulation opportunity")
+        
+        # Momentum insights
+        rsi = self.latest['RSI']
+        if rsi < 40:
+            insights.append("Oversold conditions present - potential accumulation opportunity")
+        elif rsi > 60:
+            insights.append("Approaching overbought territory - monitor for profit-taking opportunities")
+        
+        # Volatility insights
+        atr_pct = self.latest['ATR'] / self.latest['Close']
+        if atr_pct > 0.03:
+            insights.append("Elevated volatility - position size accordingly")
+        else:
+            insights.append("Low volatility environment - suitable for core positions")
+        
+        # Ownership-specific insights
+        if self.owns_stock:
+            insights.append("As a current holder, focus on risk management and position sizing")
+        else:
+            insights.append("As a potential buyer, look for strategic entry points in the target range")
+        
+        for i, insight in enumerate(insights, 1):
+            print(f"{i}. {insight}")
 
     def plot_analysis(self, save_plot: bool = False):
-        """Create comprehensive analysis plots"""
-        fig, axes = plt.subplots(4, 1, figsize=(15, 16))
+        """Create clean, focused analysis plots"""
+        sns.set_style('whitegrid')
+        fig, axes = plt.subplots(3, 1, figsize=(15, 14))
         fig.suptitle(f'{self.ticker} - Long-Term Analysis ({self.period.upper()})', 
                     fontsize=16, fontweight='bold')
         
-        # Plot 1: Price and Moving Averages
+        # Configure date formatting
+        date_fmt = mdates.DateFormatter('%b %Y')
+        
+        # Plot 1: Price and Moving Averages (Clean)
         ax1 = axes[0]
-        ax1.plot(self.data.index, self.data['Close'], label='Close Price', linewidth=2, color='black')
-        ax1.plot(self.data.index, self.data['SMA50'], label='SMA 50', alpha=0.7, color='blue')
-        ax1.plot(self.data.index, self.data['SMA200'], label='SMA 200', alpha=0.7, color='red')
-        ax1.plot(self.data.index, self.data['EMA200'], label='EMA 200', alpha=0.7, color='green', linestyle='--')
+        ax1.plot(self.data.index, self.data['Close'], label='Price', linewidth=2, color='#1f77b4')
+        ax1.plot(self.data.index, self.data['SMA200'], label='SMA 200', linewidth=1.5, color='#ff7f0e', linestyle='-')
+        ax1.plot(self.data.index, self.data['EMA200'], label='EMA 200', linewidth=1.5, color='#2ca02c', linestyle='--')
         
         # Highlight Golden/Death Crosses
         gc_dates = self.data[self.data['GC_Cross'] == 1].index
         dc_dates = self.data[self.data['DC_Cross'] == 1].index
         
         for date in gc_dates:
-            ax1.axvline(x=date, color='green', alpha=0.4, linestyle='--')
+            ax1.axvline(x=date, color='green', alpha=0.4, linestyle='--', linewidth=1)
         for date in dc_dates:
-            ax1.axvline(x=date, color='red', alpha=0.4, linestyle='--')
-            
-        ax1.set_title('Price Action with Key Moving Averages')
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
+            ax1.axvline(x=date, color='red', alpha=0.4, linestyle='--', linewidth=1)
+        
+        # Add support/resistance levels
+        ax1.plot(self.data.index, self.data['Support'], alpha=0.5, color='blue', linestyle=':', label='Support')
+        ax1.plot(self.data.index, self.data['Resistance'], alpha=0.5, color='purple', linestyle=':', label='Resistance')
+        
+        ax1.set_title('Price Action with Key Levels', fontsize=14)
+        ax1.legend(loc='best', fontsize=9)
+        ax1.xaxis.set_major_formatter(date_fmt)
         
         # Plot 2: Momentum Indicators
         ax2 = axes[1]
-        ax2.plot(self.data.index, self.data['RSI'], label='RSI', color='purple', linewidth=2)
-        ax2.plot(self.data.index, self.data['StochRSI'], label='Stochastic RSI', color='orange', alpha=0.7)
-        ax2.axhline(y=70, color='r', linestyle='--', alpha=0.5, label='Overbought')
-        ax2.axhline(y=30, color='g', linestyle='--', alpha=0.5, label='Oversold')
-        ax2.fill_between(self.data.index, 30, 70, alpha=0.1, color='yellow')
-        ax2.set_title('Momentum Indicators')
+        ax2.plot(self.data.index, self.data['RSI'], label='RSI', color='#d62728', linewidth=1.5)
+        ax2.axhline(y=70, color='r', linestyle='--', alpha=0.5)
+        ax2.axhline(y=30, color='g', linestyle='--', alpha=0.5)
+        ax2.fill_between(self.data.index, 30, 70, alpha=0.1, color='gray')
+        
+        # MACD with histogram
+        ax2_macd = ax2.twinx()
+        ax2_macd.plot(self.data.index, self.data['MACD'], label='MACD', color='#17becf', linewidth=1.5, alpha=0.7)
+        ax2_macd.plot(self.data.index, self.data['MACD_Signal'], label='Signal', color='#e377c2', linewidth=1.5, alpha=0.7)
+        ax2_macd.bar(self.data.index, self.data['MACD_Histogram'], 
+                     color=np.where(self.data['MACD_Histogram'] >= 0, '#4daf4a', '#e41a1c'), 
+                     alpha=0.5, label='Histogram')
+        
+        ax2.set_title('Momentum Indicators', fontsize=14)
         ax2.set_ylim(0, 100)
-        ax2.legend()
-        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc='upper left', fontsize=9)
+        ax2_macd.legend(loc='upper right', fontsize=9)
+        ax2.xaxis.set_major_formatter(date_fmt)
         
-        # Plot 3: MACD
+        # Plot 3: Volume and ADX
         ax3 = axes[2]
-        ax3.plot(self.data.index, self.data['MACD'], label='MACD', color='blue', linewidth=2)
-        ax3.plot(self.data.index, self.data['MACD_Signal'], label='Signal Line', color='red', linewidth=2)
-        ax3.bar(self.data.index, self.data['MACD_Histogram'], 
-                label='Histogram', alpha=0.3, color=np.where(self.data['MACD_Histogram'] >= 0, 'g', 'r'))
-        ax3.axhline(y=0, color='black', linestyle='-', alpha=0.3)
-        ax3.set_title('MACD Analysis')
-        ax3.legend()
-        ax3.grid(True, alpha=0.3)
+        # Volume bars
+        ax3.bar(self.data.index, self.data['Volume'], color='#aec7e8', alpha=0.6, label='Volume')
+        ax3.plot(self.data.index, self.data['Volume_SMA20'], color='#1f77b4', linewidth=1.5, label='20-day Avg Volume')
         
-        # Plot 4: Volume and ADX
-        ax4 = axes[3]
-        ax4.bar(self.data.index, self.data['Volume'], alpha=0.6, color='lightblue', label='Volume')
-        ax4.plot(self.data.index, self.data['Volume_SMA20'], color='red', linewidth=2, label='20-day Avg Volume')
-        ax4_trend = ax4.twinx()
-        ax4_trend.plot(self.data.index, self.data['ADX'], color='green', linewidth=2, label='ADX (Trend Strength)')
-        ax4_trend.axhline(y=25, color='blue', linestyle='--', alpha=0.5, label='Trend Threshold')
-        ax4.set_title('Volume & Trend Strength')
-        ax4.legend(loc='upper left')
-        ax4_trend.legend(loc='upper right')
-        ax4.grid(True, alpha=0.3)
+        # ADX on secondary axis
+        ax3_adx = ax3.twinx()
+        ax3_adx.plot(self.data.index, self.data['ADX'], color='#9467bd', linewidth=1.5, label='ADX (Trend Strength)')
+        ax3_adx.axhline(y=25, color='#8c564b', linestyle='--', alpha=0.7, label='Trend Threshold')
         
-        plt.tight_layout()
+        ax3.set_title('Volume & Trend Strength', fontsize=14)
+        ax3.legend(loc='upper left', fontsize=9)
+        ax3_adx.legend(loc='upper right', fontsize=9)
+        ax3.xaxis.set_major_formatter(date_fmt)
+        
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
         
         if save_plot:
             filename = f"{self.ticker}_LT_analysis_{datetime.now().strftime('%Y%m%d')}.png"
@@ -582,9 +768,11 @@ class StockAnalyzer:
         summary_data = {
             'Ticker': [self.ticker],
             'Company': [self.company_name],
+            'Owns_Stock': [self.owns_stock],
             'Analysis_Date': [datetime.now().strftime('%Y-%m-%d %H:%M')],
             'Recommendation': [self.get_recommendation()],
-            'Score': [self.score],
+            'Technical_Score': [self.score],
+            'Sentiment_Score': [self.sentiment_score],
             'Confidence': [self.confidence_level],
             'Current_Price': [self.latest['Close']],
             'RSI': [self.latest['RSI']],
@@ -604,12 +792,12 @@ class StockAnalyzer:
     
 def main():
     """Main function with enhanced user interface"""
-    print("\n" + "=" * 50)
-    print("🌟 ENHANCED STOCK ANALYSIS TOOL")
-    print("=" * 50)
-    print("📈 Optimized for Long-Term Investors (3+ month horizon)")
-    print("💼 Supports multiple stock analysis")
-    print("\n" + "-" * 50)
+    print("\n" + "=" * 70)
+    print("🌟 ENHANCED STOCK ANALYSIS TOOL FOR LONG-TERM INVESTORS")
+    print("=" * 70)
+    print("📈 Optimized for Strategic Investing (3+ month horizon)")
+    print("💼 Combines Technical Analysis with News Sentiment")
+    print("\n" + "-" * 70)
     
     # Analysis configuration
     period_map = {'1': '6mo', '2': '1y', '3': '2y', '4': '5y', '5': 'max'}
@@ -629,7 +817,7 @@ def main():
     
     # Multi-stock analysis loop
     while True:
-        print("\n" + "=" * 50)
+        print("\n" + "=" * 70)
         ticker = input("\n📊 Enter stock ticker (or 'done' to finish): ").strip().upper()
         
         if ticker == 'DONE':
@@ -638,11 +826,14 @@ def main():
         if not ticker or len(ticker) > 5:
             print("❌ Invalid ticker symbol")
             continue
+        
+        # Ownership question
+        owns_stock = input(f"Do you currently own {ticker}? (y/n): ").strip().lower() == 'y'
             
         print(f"\n🔍 Analyzing {ticker}... Please wait...")
         
         # Create analyzer and run analysis
-        analyzer = StockAnalyzer(ticker, period, "long-term")
+        analyzer = StockAnalyzer(ticker, period, "long-term", owns_stock)
         
         if not analyzer.fetch_data():
             continue
@@ -658,17 +849,38 @@ def main():
             analyzer.save_report()
     
     # Final output and suggestions
-    print("\n" + "=" * 50)
+    print("\n" + "=" * 70)
     print("✅ ANALYSIS COMPLETE!")
-    print("💡 Always conduct your own research before investing")
-    print("\n🌟 SUGGESTIONS FOR FUTURE DEVELOPMENT:")
-    print("- Fundamental data integration (P/E, EPS growth)")
-    print("- Analyst price targets and consensus ratings")
-    print("- News sentiment analysis")
-    print("- Portfolio risk/reward optimization")
-    print("- Multi-stock comparison dashboard")
-    print("- Automated email/SMS alerts")
-    print("\nHappy investing! 📈💼")
+    print("💡 Remember: Technical analysis is one tool - always consider fundamentals")
+    print("\n🔮 FUTURE ENHANCEMENT SUGGESTIONS:")
+    print("-" * 70)
+    print("1. Fundamental Analysis Integration:")
+    print("   • Add P/E, P/B, and dividend yield metrics")
+    print("   • Incorporate earnings growth projections")
+    print("   • Analyze debt-to-equity ratios")
+    
+    print("\n2. Advanced Analytics:")
+    print("   • Portfolio optimization suggestions")
+    print("   • Correlation analysis between stocks")
+    print("   • Risk-adjusted return metrics (Sharpe ratio)")
+    
+    print("\n3. User Experience Improvements:")
+    print("   • Interactive web-based dashboard")
+    print("   • Mobile app with push notifications")
+    print("   • Custom alert system for price targets")
+    
+    print("\n4. Data Source Expansion:")
+    print("   • Economic indicators (interest rates, inflation)")
+    print("   • Sector performance comparisons")
+    print("   • Insider trading activity")
+    
+    print("\n5. Machine Learning Features:")
+    print("   • Price prediction models")
+    print("   • Anomaly detection for unusual activity")
+    print("   • Sentiment analysis of earnings calls")
+    
+    print("\n" + "=" * 70)
+    print("📈 Happy Investing! 💼💰")
 
 
 if __name__ == "__main__":
